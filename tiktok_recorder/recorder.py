@@ -90,50 +90,47 @@ def _parse_live_status_from_html(html: str) -> Optional[bool]:
     TikTok bettet im HTML JSON-Daten ein, die `status`-Felder enthalten:
       - status: 2 → Stream läuft live
       - status: 4 → Stream beendet
-    Außerdem steht bei beendeten Streams oft "LIVE has ended" im Klartext.
 
-    Wichtig: Die Room-ID bleibt nach Stream-Ende noch im HTML, auch wenn
-    der Streamer offline ist. Die Existenz einer Room-ID ist also KEIN
-    zuverlässiger Live-Indikator — nur der Status zählt.
+    WICHTIG: Die Reihenfolge der Prüfungen ist entscheidend!
+    `liveRoom.status` und `liveRoomInfo.status` sind die einzigen wirklich
+    zuverlässigen Felder. Generische `"status":...` Treffer und der String
+    "LIVE has ended" können auch im JavaScript-Bundle für UI-Strings stehen,
+    ohne dass sie den aktuellen Stream-Zustand widerspiegeln.
 
     Rückgabe:
         True  → eindeutig live
         False → eindeutig offline
         None  → unklar (HTML enthält keine eindeutigen Status-Hinweise)
     """
-    # 1. Klartext-Hinweise auf "beendet"
-    if "LIVE has ended" in html:
-        return False
-
-    # 2. Status-Felder im eingebetteten JSON.
-    #    `\d+` erlaubt z.B. "status":2 oder "status":4
-    #    Wir sammeln ALLE Vorkommen und entscheiden danach.
-    statuses = [int(x) for x in re.findall(r'"status"\s*:\s*(\d+)', html)]
-    if statuses:
-        # Wenn irgendwo status=4 (ended) auftaucht, ist der Stream sicher offline.
-        # Das überschreibt jeden anderen Hinweis, weil "ended" eindeutiger ist
-        # als "live" — TikTok kann eine alte Room-ID mit "live" cachen, aber
-        # "ended" wird gezielt gesetzt.
-        if 4 in statuses:
-            return False
-        # Sonst: wenn überall nur status=2 (live) vorkommt → live
-        if 2 in statuses and all(s in (2, 0) for s in statuses):
-            return True
-
-    # 3. liveRoom.status spezifischer prüfen (falls vorhanden, sehr verlässlich)
+    # 1. liveRoom.status — DIE verlässlichste Quelle (wenn vorhanden)
     m = re.search(r'"liveRoom"\s*:\s*\{[^{}]*?"status"\s*:\s*(\d+)', html)
     if m:
         return int(m.group(1)) == 2
 
-    # 4. liveRoomInfo.status — alternative Position im JSON
+    # 2. liveRoomInfo.status — alternatives Feld
     m = re.search(r'"liveRoomInfo"\s*:\s*\{[^{}]*?"status"\s*:\s*(\d+)', html)
     if m:
         return int(m.group(1)) == 2
 
-    # 5. isLive-Boolean (älteres Format)
+    # 3. isLive-Boolean (wenn vorhanden, ist es eindeutig)
     m = re.search(r'"isLive"\s*:\s*(true|false)', html)
     if m:
         return m.group(1) == "true"
+
+    # 4. Generischer status-Fallback nur, wenn keiner der spezifischen
+    #    Indikatoren da war. status=4 (beendet) gewinnt vor status=2 (live),
+    #    weil ended-Marker selten falsch gesetzt sind.
+    statuses = [int(x) for x in re.findall(r'"status"\s*:\s*(\d+)', html)]
+    if statuses:
+        if 4 in statuses:
+            return False
+        if 2 in statuses:
+            return True
+
+    # 5. Klartext-Heuristik nur als ALLERletzter Fallback —
+    #    dieser String steht oft auch in UI-Übersetzungen, also unzuverlässig
+    if "LIVE has ended" in html:
+        return False
 
     return None
 
