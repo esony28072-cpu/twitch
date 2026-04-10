@@ -83,10 +83,68 @@ def _new_session() -> requests.Session:
     return s
 
 
+def _parse_live_status_from_html(html: str) -> Optional[bool]:
+    """
+    Versucht, den Live-Status direkt aus dem HTML der /live-Seite zu lesen.
+
+    TikTok bettet im HTML JSON-Daten ein, die `status`-Felder enthalten:
+      - status: 2 → Stream läuft live
+      - status: 4 → Stream beendet
+    Außerdem steht bei beendeten Streams oft "LIVE has ended" im Klartext.
+
+    Wichtig: Die Room-ID bleibt nach Stream-Ende noch im HTML, auch wenn
+    der Streamer offline ist. Die Existenz einer Room-ID ist also KEIN
+    zuverlässiger Live-Indikator — nur der Status zählt.
+
+    Rückgabe:
+        True  → eindeutig live
+        False → eindeutig offline
+        None  → unklar (HTML enthält keine eindeutigen Status-Hinweise)
+    """
+    # 1. Klartext-Hinweise auf "beendet"
+    if "LIVE has ended" in html:
+        return False
+
+    # 2. Status-Felder im eingebetteten JSON.
+    #    `\d+` erlaubt z.B. "status":2 oder "status":4
+    #    Wir sammeln ALLE Vorkommen und entscheiden danach.
+    statuses = [int(x) for x in re.findall(r'"status"\s*:\s*(\d+)', html)]
+    if statuses:
+        # Wenn irgendwo status=4 (ended) auftaucht, ist der Stream sicher offline.
+        # Das überschreibt jeden anderen Hinweis, weil "ended" eindeutiger ist
+        # als "live" — TikTok kann eine alte Room-ID mit "live" cachen, aber
+        # "ended" wird gezielt gesetzt.
+        if 4 in statuses:
+            return False
+        # Sonst: wenn überall nur status=2 (live) vorkommt → live
+        if 2 in statuses and all(s in (2, 0) for s in statuses):
+            return True
+
+    # 3. liveRoom.status spezifischer prüfen (falls vorhanden, sehr verlässlich)
+    m = re.search(r'"liveRoom"\s*:\s*\{[^{}]*?"status"\s*:\s*(\d+)', html)
+    if m:
+        return int(m.group(1)) == 2
+
+    # 4. liveRoomInfo.status — alternative Position im JSON
+    m = re.search(r'"liveRoomInfo"\s*:\s*\{[^{}]*?"status"\s*:\s*(\d+)', html)
+    if m:
+        return int(m.group(1)) == 2
+
+    # 5. isLive-Boolean (älteres Format)
+    m = re.search(r'"isLive"\s*:\s*(true|false)', html)
+    if m:
+        return m.group(1) == "true"
+
+    return None
+
+
 def _get_room_id(username: str) -> Optional[str]:
     """
     Holt die aktuelle Room-ID eines Benutzers über die Live-Seite.
-    Die Room-ID ist nur gesetzt, wenn der User gerade einen Live-Stream hat.
+
+    Wichtig: Eine Room-ID kann auch nach Stream-Ende noch existieren!
+    Diese Funktion liefert nur die ID, ohne den Live-Status zu beurteilen.
+    Den Status prüft `is_user_live()` separat.
     """
     url = f"https://www.tiktok.com/@{username}/live"
     session = _new_session()
@@ -104,7 +162,6 @@ def _get_room_id(username: str) -> Optional[str]:
 
     html = r.text
 
-    # TikTok liefert im HTML einen JSON-Block mit "roomId"
     patterns = [
         r'"roomId":"(\d+)"',
         r'"room_id":"(\d+)"',
@@ -119,13 +176,23 @@ def _get_room_id(username: str) -> Optional[str]:
                 log.debug("Room-ID gefunden für @%s: %s", username, room_id)
                 return room_id
 
-    # Heuristik: Wenn die Seite eindeutig "offline" enthält, ist der User nicht live
-    if "LIVE has ended" in html or '"isLive":false' in html:
-        log.debug("@%s ist offline (Heuristik)", username)
-        return None
-
     log.debug("Keine Room-ID in HTML für @%s gefunden", username)
     return None
+
+
+def _fetch_live_html(username: str) -> Optional[str]:
+    """Lädt die /live-Seite einmal und gibt das HTML zurück (oder None bei Fehler)."""
+    url = f"https://www.tiktok.com/@{username}/live"
+    session = _new_session()
+    try:
+        r = session.get(url, timeout=15, allow_redirects=True)
+    except requests.RequestException as e:
+        log.warning("Netzwerkfehler beim Abrufen von @%s: %s", username, e)
+        return None
+    if r.status_code != 200:
+        log.warning("Status %s für @%s", r.status_code, username)
+        return None
+    return r.text
 
 
 def _check_live_via_webcast(room_id: str) -> Optional[bool]:
@@ -165,30 +232,58 @@ def is_user_live(username: str) -> bool:
     """
     Prüft, ob ein Streamer derzeit live ist.
 
-    Strategie:
-    1. Room-ID aus der /live-Seite extrahieren
-    2. Status über den Webcast-API-Endpoint verifizieren
-    3. Fällt die API aus, gilt eine vorhandene Room-ID alleine bereits als Indikator
+    Strategie (in dieser Reihenfolge):
+    1. HTML der /live-Seite einmal laden
+    2. Status direkt aus dem HTML lesen (status:2 = live, status:4 = ended)
+       — das ist verlässlicher als die Existenz einer Room-ID, weil
+       Room-IDs auch nach Stream-Ende noch im HTML stehen können
+    3. Falls HTML-Status unklar ist: Webcast-API als Zweitmeinung fragen
+    4. Falls beides unklar: KONSERVATIV als offline werten
+       (lieber eine Aufnahme verpassen als Geister-Aufnahmen produzieren)
     """
-    room_id = _get_room_id(username)
-    if not room_id:
-        log.info("Live-Check @%s: keine Room-ID → offline", username)
+    html = _fetch_live_html(username)
+    if html is None:
+        log.info("Live-Check @%s: HTML nicht erreichbar → offline", username)
         return False
 
-    status = _check_live_via_webcast(room_id)
-    if status is None:
-        # API-Aufruf fehlgeschlagen — konservativ: vorhandene Room-ID als "live" werten
-        log.info(
-            "Live-Check @%s: Room-ID %s vorhanden, Webcast-API blockt → "
-            "werte als LIVE", username, room_id,
-        )
+    # Primärer Pfad: Status direkt aus dem HTML lesen
+    html_status = _parse_live_status_from_html(html)
+    if html_status is True:
+        log.info("Live-Check @%s: HTML sagt LIVE", username)
         return True
+    if html_status is False:
+        log.info("Live-Check @%s: HTML sagt OFFLINE", username)
+        return False
 
+    # Sekundärer Pfad: Wenn HTML keinen klaren Status liefert,
+    # versuche es mit der Webcast-API über die Room-ID
+    room_id = None
+    for pat in (r'"roomId":"(\d+)"', r'"room_id":"(\d+)"', r'"roomId":(\d+)'):
+        m = re.search(pat, html)
+        if m and m.group(1) != "0":
+            room_id = m.group(1)
+            break
+
+    if not room_id:
+        log.info("Live-Check @%s: keine Room-ID, kein Status → offline", username)
+        return False
+
+    api_status = _check_live_via_webcast(room_id)
+    if api_status is True:
+        log.info("Live-Check @%s: Webcast-API sagt LIVE (Room %s)", username, room_id)
+        return True
+    if api_status is False:
+        log.info("Live-Check @%s: Webcast-API sagt OFFLINE (Room %s)", username, room_id)
+        return False
+
+    # Komplett unklar — konservativ als offline werten,
+    # damit wir keine Geister-Aufnahmen für längst beendete Streams starten
     log.info(
-        "Live-Check @%s: Room-ID %s, API-Status=%s → %s",
-        username, room_id, status, "LIVE" if status else "offline",
+        "Live-Check @%s: Status unklar (Room %s, API blockt) → "
+        "konservativ OFFLINE",
+        username, room_id,
     )
-    return status
+    return False
 
 
 # --------------------------------------------------------------------------- #
