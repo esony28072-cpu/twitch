@@ -1,0 +1,43 @@
+[Unit]
+Description=TikTok Live Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Anpassen: Benutzer, unter dem der Dienst läuft
+User=tiktok
+Group=tiktok
+
+# Anpassen: Pfad zum Projekt-Ordner
+WorkingDirectory=/opt/tiktok_recorder
+
+# Anpassen: Pfad zum Python-Interpreter (oder venv)
+ExecStart=/opt/tiktok_recorder/venv/bin/python main.py
+
+# Konfiguration über Umgebungsvariablen
+Environment="TTR_HOST=0.0.0.0"
+Environment="TTR_PORT=8765"
+Environment="TTR_OPEN=0"
+# WICHTIG: Auth-Daten setzen, wenn der Server aus dem Internet erreichbar ist!
+Environment="TTR_AUTH_USER=admin"
+Environment="TTR_AUTH_PASS=Sommer2026"
+
+# Restart-Verhalten
+Restart=on-failure
+RestartSec=10s
+
+# Logs gehen ins journal
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Schreibrechte nur für die nötigen Pfade
+ReadWritePaths=/opt/tiktok_recorder /home/tiktok/.tiktok_recorder /home/tiktok/TikTokRecordings
+
+[Install]
+WantedBy=multi-user.target

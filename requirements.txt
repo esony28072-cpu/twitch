@@ -1,0 +1,4 @@
+Flask>=3.0.0
+requests>=2.31.0
+brotli>=1.1.0   # Damit requests Brotli-komprimierte Antworten lesen kann
+TikTokLive>=6.0.0  # optional, stabilere Live-Erkennung falls installiert
